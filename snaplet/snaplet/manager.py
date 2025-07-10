@@ -8,7 +8,7 @@ import tempfile
 from typing import List, Optional
 
 import cv2
-from moviepy.editor import ImageSequenceClip
+from moviepy import ImageSequenceClip
 from PIL import Image
 
 from snaplet.const import (
@@ -21,9 +21,6 @@ from snaplet.const import (
     DEFAULT_VIDEO_CRF,
     DEFAULT_VIDEO_PRESET,
     DEFAULT_VIDEO_THREADS,
-    FFMPEG_CMD,
-    PNG_HEADER,
-    PNG_IEND,
 )
 
 
@@ -72,6 +69,7 @@ class SnapletManager:
         """
         使用 ffprobe 获取视频中所有关键帧的时间戳（秒）
         """
+        # fmt: off
         cmd = [
             "ffprobe",
             "-select_streams", "v",
@@ -81,6 +79,7 @@ class SnapletManager:
             "-print_format", "json",
             video_path,
         ]
+        # fmt: on
         if verbose:
             print(f"[FFprobe] 获取关键帧时间戳: {' '.join(cmd)}")
         proc = subprocess.run(cmd, capture_output=True, text=True)
@@ -127,6 +126,7 @@ class SnapletManager:
         for i, ts in enumerate(selected_ts, 1):
             if verbose:
                 print(f"[FFmpeg] 提取关键帧 {i}/{len(selected_ts)}，时间点: {ts:.3f}s")
+            # fmt: off
             cmd = [
                 "ffmpeg",
                 "-hide_banner",
@@ -138,6 +138,7 @@ class SnapletManager:
                 "-vcodec", "png",
                 "-",
             ]
+            # fmt: on
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             out, err = proc.communicate()
             if proc.returncode != 0:
@@ -271,7 +272,7 @@ class SnapletManager:
         :return: 抽样帧列表。
         """
         total = len(frames)
-        if sample_count >= total:
+        if sample_count <= 0 or sample_count >= total:
             return frames.copy()
 
         interval = total / sample_count
@@ -288,7 +289,7 @@ class SnapletManager:
         """
         拼接多张图片成多宫格。
 
-        自动计算行列数，满足 rows * cols >= 图片数量，且 rows <= cols，行列尽量接近。
+        自动计算行列数，满足 rows * cols >= 图片数量，且 cols <= rows，行列尽量接近。
 
         :param images: 图片列表。
         :param max_frames: 最大帧数，超出截断。
@@ -310,8 +311,8 @@ class SnapletManager:
 
         for rows in range(1, total + 1):
             cols = math.ceil(total / rows)
-            if rows <= cols:
-                diff = cols - rows
+            if cols <= rows:
+                diff = rows - cols
                 if min_diff is None or diff < min_diff:
                     min_diff = diff
                     best_rows, best_cols = rows, cols
@@ -372,12 +373,7 @@ class SnapletManager:
 
             clip = ImageSequenceClip(temp_files, fps=fps)
             loop_count = 0 if loop else 1
-            clip.write_gif(
-                output_path,
-                loop=loop_count,
-                verbose=verbose,
-                program=FFMPEG_CMD,
-            )
+            clip.write_gif(output_path, loop=loop_count, logger="bar" if verbose else None)
             if verbose:
                 print(f"[GIF] 生成完成: {output_path}")
         finally:
@@ -426,29 +422,27 @@ class SnapletManager:
                 img.save(temp_path)
                 temp_files.append(temp_path)
 
-            clip = ImageSequenceClip(temp_files, fps=fps)
+            # fmt: off
+            ffmpeg_params = [
+                "-preset", preset,
+                "-crf", str(crf),
+                "-threads", str(threads),
+            ]
+            # fmt: on
 
             if size is not None:
-                clip = clip.resize(newsize=size)
-
-            ffmpeg_params = [
-                "-preset",
-                preset,
-                "-crf",
-                str(crf),
-                "-threads",
-                str(threads),
-            ]
+                ffmpeg_params.extend(["-vf", f"scale={size[0]}:{size[1]}"])
 
             write_params = dict(
                 codec=codec,
                 audio=audio,
-                verbose=verbose,
                 ffmpeg_params=ffmpeg_params,
+                logger="bar" if verbose else None,
             )
             if bitrate:
                 write_params["bitrate"] = bitrate
 
+            clip = ImageSequenceClip(temp_files, fps=fps)
             clip.write_videofile(output_path, **write_params)
 
             if verbose:

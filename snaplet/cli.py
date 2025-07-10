@@ -12,7 +12,7 @@ from snaplet.const import (
     DEFAULT_TARGET_SIZE_MB,
     DEFAULT_THRESHOLD,
 )
-from snaplet.snaplet.manager import SnapletManager
+from snaplet.snaplet import SnapletManager
 from snaplet.utils import default_output_path, parse_color
 
 app = typer.Typer(help="Snaplet - 视频关键帧提取与重组工具")
