@@ -1,6 +1,7 @@
 import math
 import os
 import shutil
+import subprocess
 import tempfile
 from typing import List, Optional
 
@@ -8,32 +9,217 @@ import cv2
 from moviepy.editor import ImageSequenceClip
 from PIL import Image
 
+from snaplet.const import (
+    DEFAULT_BG_COLOR,
+    DEFAULT_FPS,
+    DEFAULT_GIF_COLORS,
+    DEFAULT_PADDING,
+    DEFAULT_THRESHOLD,
+    DEFAULT_VIDEO_CODEC,
+    DEFAULT_VIDEO_CRF,
+    DEFAULT_VIDEO_PRESET,
+    DEFAULT_VIDEO_THREADS,
+    FFMPEG_CMD,
+    PNG_HEADER,
+    PNG_IEND,
+)
+
 
 class SnapletManager:
     def __init__(self):
         """
-        SnapletManager 初始化类，暂时无状态变量。
+        SnapletManager 初始化类，无状态。
         """
         pass
 
     def extract_keyframes(
         self,
         video_path: str,
-        threshold: float = 30.0,
+        threshold: float = DEFAULT_THRESHOLD,
+        max_frames: Optional[int] = None,
+        use_ffmpeg: bool = True,
         verbose: bool = False,
     ) -> List[Image.Image]:
         """
-        从视频中提取关键帧，返回PIL图片列表。
+        提取视频关键帧。
 
-        通过计算相邻帧灰度图的差异，判断是否为关键帧。
-        差异超过阈值则认为是关键帧。
+        - FFmpeg模式（默认）：提取编码I帧，效率高，阈值参数无效。
+        - 分桶采样模式：均匀分布采样，阈值参数无效。
+        - 基于帧差异的传统算法：阈值参数生效。
 
-        :param video_path: 输入视频路径
-        :param threshold: 关键帧差异阈值，百分比，越大提取帧越少
-        :param verbose: 是否打印详细信息
-        :return: 关键帧PIL图片列表
-        :raises FileNotFoundError: 视频文件不存在时抛出
-        :raises IOError: 视频文件无法打开时抛出
+        :param video_path: 视频文件路径。
+        :param threshold: 帧间差异阈值，仅基于帧差异算法生效。
+        :param max_frames: 最大提取帧数。
+        :param use_ffmpeg: 是否使用FFmpeg模式。
+        :param verbose: 是否打印日志。
+        :return: 关键帧PIL图片列表。
+        """
+        if use_ffmpeg:
+            try:
+                return self._extract_keyframes_ffmpeg(video_path, max_frames, verbose)
+            except Exception as e:
+                if verbose:
+                    print(f"[WARN] FFmpeg提取失败，切换分桶采样模式: {e}")
+
+        if max_frames is not None:
+            return self._extract_keyframes_bucket_sampling(video_path, max_frames, verbose=verbose)
+
+        return self._extract_keyframes_frame_diff(video_path, threshold, verbose)
+
+    def _extract_keyframes_ffmpeg(self, video_path: str, max_frames: Optional[int], verbose: bool) -> List[Image.Image]:
+        """
+        使用FFmpeg提取视频编码中的I帧（关键帧）。
+
+        注意：
+            I帧分布由编码器决定，可能不均匀，通常集中在场景切换处。
+            本方法提取所有I帧后，调用方应自行均匀采样以避免帧集中。
+
+        :param video_path: 视频路径。
+        :param max_frames: 最大帧数限制。
+        :param verbose: 是否打印日志。
+        :return: 关键帧列表。
+        :raises RuntimeError: FFmpeg未安装或不可用。
+        """
+        import io
+        import shutil
+
+        if not shutil.which(FFMPEG_CMD):
+            raise RuntimeError("FFmpeg 未安装或未加入系统PATH")
+
+        if verbose:
+            print(f"[FFmpeg] 提取关键帧，最大帧数: {max_frames or '无限制'}")
+
+        cmd = [
+            FFMPEG_CMD,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            video_path,
+            "-vf",
+            "select=eq(pict_type\\,I)",
+            "-vsync",
+            "0",
+            "-f",
+            "image2pipe",
+            "-vcodec",
+            "png",
+            "-",
+        ]
+
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE if verbose else subprocess.DEVNULL,
+            bufsize=10**8,
+        )
+
+        keyframes = []
+        frame_count = 0
+
+        buffer = b""
+
+        try:
+            while True:
+                if max_frames is not None and frame_count >= max_frames:
+                    break
+
+                data = process.stdout.read(4096)
+                if not data:
+                    break
+                buffer += data
+
+                while True:
+                    start_idx = buffer.find(PNG_HEADER)
+                    if start_idx == -1:
+                        break
+                    iend_idx = buffer.find(PNG_IEND, start_idx)
+                    if iend_idx == -1 or iend_idx + 8 > len(buffer):
+                        break
+                    end_idx = iend_idx + 8
+                    png_data = buffer[start_idx:end_idx]
+                    buffer = buffer[end_idx:]
+
+                    try:
+                        img = Image.open(io.BytesIO(png_data))
+                        img.load()
+                        if img.mode != "RGB":
+                            img = img.convert("RGB")
+                        keyframes.append(img)
+                        frame_count += 1
+                        if verbose:
+                            print(f"[FFmpeg] 解析关键帧 #{frame_count}")
+                    except Exception as e:
+                        if verbose:
+                            print(f"[FFmpeg] 解析关键帧失败: {e}")
+                        continue
+        finally:
+            if process.stdout:
+                process.stdout.close()
+            if process.stderr:
+                process.stderr.close()
+            process.wait()
+
+        if verbose:
+            print(f"[FFmpeg] 实际提取关键帧数: {len(keyframes)}")
+        return keyframes
+
+    def _extract_keyframes_bucket_sampling(self, video_path: str, max_frames: int, verbose: bool) -> List[Image.Image]:
+        """
+        分桶采样算法：
+
+        将视频均分为max_frames个桶，每桶保留差异最大的帧。
+
+        :param video_path: 视频路径。
+        :param max_frames: 最大帧数。
+        :param verbose: 是否打印日志。
+        :return: 关键帧列表。
+        """
+        cap = cv2.VideoCapture(video_path)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        buckets = [{"max_diff": -1, "frame": None} for _ in range(max_frames)]
+        prev_gray = None
+
+        for frame_idx in range(total_frames):
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            if prev_gray is None:
+                diff_value = float("inf")
+            else:
+                diff = cv2.absdiff(gray, prev_gray)
+                diff_value = cv2.countNonZero(diff) / diff.size * 100
+
+            bucket_idx = min(frame_idx * max_frames // total_frames, max_frames - 1)
+
+            if diff_value > buckets[bucket_idx]["max_diff"]:
+                img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                buckets[bucket_idx] = {"max_diff": diff_value, "frame": img}
+                if verbose:
+                    print(f"[Bucket] 桶{bucket_idx}更新帧{frame_idx} (差异: {diff_value:.1f}%)")
+
+            prev_gray = gray
+
+        cap.release()
+        return [b["frame"] for b in buckets if b["frame"] is not None]
+
+    def _extract_keyframes_frame_diff(
+        self,
+        video_path: str,
+        threshold: float = DEFAULT_THRESHOLD,
+        verbose: bool = False,
+    ) -> List[Image.Image]:
+        """
+        基于帧间灰度差异提取关键帧。
+
+        :param video_path: 视频路径。
+        :param threshold: 差异阈值百分比。
+        :param verbose: 是否打印日志。
+        :return: 关键帧列表。
+        :raises FileNotFoundError: 视频文件不存在。
+        :raises IOError: 视频文件无法打开。
         """
         if not os.path.isfile(video_path):
             raise FileNotFoundError(f"视频文件不存在: {video_path}")
@@ -43,126 +229,78 @@ class SnapletManager:
             raise IOError(f"无法打开视频文件: {video_path}")
 
         keyframes = []
-        prev_frame_gray = None
+        prev_gray = None
         frame_idx = 0
-        saved_idx = 0
+        saved_count = 0
 
         while True:
             ret, frame = cap.read()
             if not ret:
                 break
 
-            # 转为灰度图，便于计算差异
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-            if prev_frame_gray is None:
-                # 第一帧直接保存
+            if prev_gray is None:
                 img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
                 keyframes.append(img)
-                prev_frame_gray = gray
-                saved_idx += 1
+                prev_gray = gray
+                saved_count += 1
                 if verbose:
-                    print(f"保存关键帧 #{saved_idx} (帧号 {frame_idx})")
+                    print(f"[FrameDiff] 保存关键帧 #{saved_count} (帧号 {frame_idx})")
             else:
-                # 计算当前帧与上一关键帧的差异
-                diff = cv2.absdiff(gray, prev_frame_gray)
-                non_zero_count = cv2.countNonZero(diff)
-                mean_diff = non_zero_count / diff.size * 100  # 百分比差异
+                diff = cv2.absdiff(gray, prev_gray)
+                non_zero = cv2.countNonZero(diff)
+                mean_diff = non_zero / diff.size * 100
 
                 if mean_diff > threshold:
                     img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
                     keyframes.append(img)
-                    prev_frame_gray = gray
-                    saved_idx += 1
+                    prev_gray = gray
+                    saved_count += 1
                     if verbose:
-                        print(f"保存关键帧 #{saved_idx} (帧号 {frame_idx}) 差异: {mean_diff:.2f}%")
+                        print(f"[FrameDiff] 保存关键帧 #{saved_count} (帧号 {frame_idx}) 差异: {mean_diff:.2f}%")
 
             frame_idx += 1
 
         cap.release()
         if verbose:
-            print(f"共提取关键帧: {len(keyframes)} 张")
+            print(f"[FrameDiff] 共提取关键帧: {len(keyframes)} 张")
         return keyframes
 
     def sample_frames(self, frames: List[Image.Image], sample_count: int) -> List[Image.Image]:
         """
-        从完整帧列表中等间距抽取指定数量的帧。
+        等间距抽取指定数量帧。
 
-        如果请求的帧数大于等于总帧数，则返回全部帧的副本。
-
-        :param frames: 完整帧列表
-        :param sample_count: 需要抽取的帧数
-        :return: 抽取后的帧列表
+        :param frames: 原始帧列表。
+        :param sample_count: 目标帧数。
+        :return: 抽样帧列表。
         """
         total = len(frames)
         if sample_count >= total:
             return frames.copy()
 
         interval = total / sample_count
-        sampled = []
-        for i in range(sample_count):
-            idx = int(i * interval)
-            sampled.append(frames[idx])
+        sampled = [frames[int(i * interval)] for i in range(sample_count)]
         return sampled
-
-    def concat_images_horizontally(self, images: List[Image.Image]) -> Image.Image:
-        """
-        将多张PIL图片水平拼接成一张大图。
-
-        会将所有图片等比例缩放到最大高度一致。
-
-        :param images: PIL图片列表
-        :return: 拼接后的PIL图片
-        :raises ValueError: 图片列表为空时抛出
-        """
-        if not images:
-            raise ValueError("图片列表不能为空")
-
-        max_height = max(img.height for img in images)
-        resized_images = []
-        for img in images:
-            if img.height != max_height:
-                ratio = max_height / img.height
-                new_width = int(img.width * ratio)
-                resized = img.resize((new_width, max_height), Image.LANCZOS)
-                resized_images.append(resized)
-            else:
-                resized_images.append(img)
-
-        total_width = sum(img.width for img in resized_images)
-        new_img = Image.new("RGB", (total_width, max_height))
-
-        x_offset = 0
-        for img in resized_images:
-            new_img.paste(img, (x_offset, 0))
-            x_offset += img.width
-
-        return new_img
 
     def concat_images_grid(
         self,
         images: List[Image.Image],
-        rows: Optional[int] = 5,
-        cols: Optional[int] = 5,
         max_frames: Optional[int] = None,
-        padding: int = 5,
-        bg_color=(255, 255, 255),
+        padding: int = DEFAULT_PADDING,
+        bg_color=DEFAULT_BG_COLOR,
     ) -> Image.Image:
         """
-        将多张图片拼接成多宫格。
+        拼接多张图片成多宫格。
 
-        支持指定行数或列数，自动计算另一维度。
-        支持最大帧数限制，超出部分截断。
-        图片会缩放到最小宽高一致，保证整齐排列。
+        自动计算行列数，满足 rows * cols >= 图片数量，且 rows <= cols，行列尽量接近。
 
-        :param images: PIL图片列表
-        :param rows: 指定行数（优先）
-        :param cols: 指定列数（次之）
-        :param max_frames: 最大提取帧数，超过截断
-        :param padding: 图片间距，默认5像素
-        :param bg_color: 背景颜色，默认白色
-        :return: 拼接后的PIL图片
-        :raises ValueError: 图片列表为空时抛出
+        :param images: 图片列表。
+        :param max_frames: 最大帧数，超出截断。
+        :param padding: 图片间距，默认1像素。
+        :param bg_color: 背景颜色，RGB三元组。
+        :return: 拼接后的图片。
+        :raises ValueError: 图片列表为空。
         """
         if not images:
             raise ValueError("图片列表不能为空")
@@ -172,21 +310,21 @@ class SnapletManager:
 
         total = len(images)
 
-        # 自动计算行列数
-        if rows is None and cols is None:
-            cols = int(math.ceil(math.sqrt(total)))
-            rows = int(math.ceil(total / cols))
-        elif rows is not None and cols is None:
-            cols = int(math.ceil(total / rows))
-        elif cols is not None and rows is None:
-            rows = int(math.ceil(total / cols))
+        best_rows, best_cols = None, None
+        min_diff = None
 
-        max_cells = rows * cols
-        if total > max_cells:
-            images = images[:max_cells]
-            total = max_cells
+        for rows in range(1, total + 1):
+            cols = math.ceil(total / rows)
+            if rows <= cols:
+                diff = cols - rows
+                if min_diff is None or diff < min_diff:
+                    min_diff = diff
+                    best_rows, best_cols = rows, cols
+                if diff == 0:
+                    break
 
-        # 统一缩放到最小宽高，保证整齐
+        rows, cols = best_rows, best_cols
+
         min_width = min(img.width for img in images)
         min_height = min(img.height for img in images)
         resized_images = [img.resize((min_width, min_height), Image.LANCZOS) for img in images]
@@ -209,26 +347,21 @@ class SnapletManager:
         self,
         images: List[Image.Image],
         output_path: str,
-        fps: int = 10,
+        fps: int = DEFAULT_FPS,
         loop: bool = True,
-        optimize: bool = True,  # 保留参数，方便未来扩展
-        colors: int = 64,
+        colors: int = DEFAULT_GIF_COLORS,
         verbose: bool = False,
     ) -> None:
         """
-        根据PIL图片序列生成GIF。
+        根据图片序列生成GIF。
 
-        通过将图片转换为调色板模式减少颜色数，减小GIF体积。
-        使用moviepy调用ffmpeg生成GIF，稳定且支持循环。
-
-        :param images: PIL图片列表
-        :param output_path: 输出GIF路径
-        :param fps: 帧率，默认10
-        :param loop: 是否循环播放，True表示无限循环
-        :param optimize: 是否启用优化（当前未实现，仅保留参数）
-        :param colors: 调色板颜色数，默认64色
-        :param verbose: 是否打印详细信息
-        :raises ValueError: 图片列表为空时抛出
+        :param images: 图片列表。
+        :param output_path: 输出路径。
+        :param fps: 帧率。
+        :param loop: 是否循环播放。
+        :param colors: 调色板颜色数。
+        :param verbose: 是否打印日志。
+        :raises ValueError: 图片列表为空。
         """
         if not images:
             raise ValueError("图片列表不能为空")
@@ -237,20 +370,18 @@ class SnapletManager:
         try:
             temp_files = []
             for i, img in enumerate(images):
-                # 转为P模式减少颜色数，减小GIF体积
                 p_img = img.convert("P", palette=Image.ADAPTIVE, colors=colors)
                 temp_path = os.path.join(temp_dir, f"frame_{i:04d}.png")
                 p_img.save(temp_path)
                 temp_files.append(temp_path)
 
             clip = ImageSequenceClip(temp_files, fps=fps)
-
-            loop_count = 0 if loop else 1  # 0表示无限循环，1表示播放一次
+            loop_count = 0 if loop else 1
             clip.write_gif(
                 output_path,
                 loop=loop_count,
                 verbose=verbose,
-                program="ffmpeg",  # moviepy默认用imageio，ffmpeg更稳定
+                program=FFMPEG_CMD,
             )
             if verbose:
                 print(f"[GIF] 生成完成: {output_path}")
@@ -261,33 +392,31 @@ class SnapletManager:
         self,
         images: List[Image.Image],
         output_path: str,
-        fps: int = 10,
+        fps: int = DEFAULT_FPS,
         size: Optional[tuple] = None,
-        codec: str = "libx264",
-        preset: str = "medium",
-        crf: int = 28,
+        codec: str = DEFAULT_VIDEO_CODEC,
+        preset: str = DEFAULT_VIDEO_PRESET,
+        crf: int = DEFAULT_VIDEO_CRF,
         bitrate: Optional[str] = None,
         audio: bool = False,
         verbose: bool = False,
-        threads: int = 4,
+        threads: int = DEFAULT_VIDEO_THREADS,
     ) -> None:
         """
-        根据PIL图片序列生成视频。
+        根据图片序列生成视频。
 
-        使用moviepy调用ffmpeg编码，支持调整分辨率、编码参数。
-
-        :param images: PIL图片列表
-        :param output_path: 输出视频路径
-        :param fps: 帧率，默认10
-        :param size: (width, height)，默认使用图片尺寸
-        :param codec: 视频编码器，默认libx264
-        :param preset: 编码预设，默认medium，影响编码速度和压缩率
-        :param crf: 视频质量参数，0-51，越小质量越好，默认28
-        :param bitrate: 比特率，如 "5000k"，优先级高于crf
-        :param audio: 是否包含音频，默认False
-        :param verbose: 是否打印详细信息
-        :param threads: 编码线程数，默认4
-        :raises ValueError: 图片列表为空时抛出
+        :param images: 图片列表。
+        :param output_path: 输出路径。
+        :param fps: 帧率。
+        :param size: (宽, 高)。
+        :param codec: 编码器。
+        :param preset: 编码预设。
+        :param crf: 质量参数。
+        :param bitrate: 比特率，优先级高于crf。
+        :param audio: 是否包含音频。
+        :param verbose: 是否打印日志。
+        :param threads: 编码线程数。
+        :raises ValueError: 图片列表为空。
         """
         if not images:
             raise ValueError("图片列表不能为空")
@@ -296,7 +425,6 @@ class SnapletManager:
         try:
             temp_files = []
             for i, img in enumerate(images):
-                # 调整尺寸
                 if size is not None:
                     img = img.resize(size, Image.Resampling.LANCZOS)
                 temp_path = os.path.join(temp_dir, f"frame_{i:05d}.png")
@@ -305,11 +433,9 @@ class SnapletManager:
 
             clip = ImageSequenceClip(temp_files, fps=fps)
 
-            # clip.resize 也可以调整尺寸，冗余但安全
             if size is not None:
                 clip = clip.resize(newsize=size)
 
-            # ffmpeg参数，传递给ffmpeg编码器
             ffmpeg_params = [
                 "-preset",
                 preset,
