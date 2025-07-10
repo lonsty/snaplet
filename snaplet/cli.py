@@ -23,7 +23,7 @@ manager = SnapletManager()
 @app.command("extract")
 def extract(
     video_path: str = typer.Argument(..., help="输入视频文件路径"),
-    max_frames: int = typer.Option(DEFAULT_MAX_FRAMES, "--max-frames", "-m", min=1, help="最大提取关键帧数，默认25"),
+    max_frames: int = typer.Option(DEFAULT_MAX_FRAMES, "--max-frames", "-m", min=1, help="最大提取关键帧数，默认30"),
     ffmpeg: bool = typer.Option(True, "--ffmpeg/--no-ffmpeg", help="是否使用FFmpeg模式提取关键帧"),
     threshold: float = typer.Option(
         DEFAULT_THRESHOLD, "--threshold", "-t", min=0.0, help="关键帧差异阈值，仅非FFmpeg模式生效，默认80"
@@ -35,16 +35,6 @@ def extract(
 ) -> None:
     """
     提取视频关键帧，等间距抽取指定数量帧并拼接成多宫格图片。
-
-    :param video_path: 输入视频文件路径。
-    :param max_frames: 最大提取关键帧数，默认25。
-    :param ffmpeg: 是否使用FFmpeg模式提取关键帧。
-    :param threshold: 关键帧差异阈值，仅非FFmpeg模式生效，默认80。
-    :param output_path: 输出拼接图片路径，默认自动生成。
-    :param padding: 拼接图片间距，默认1像素。
-    :param bg_color: 拼接图片背景色，支持颜色名或十六进制，默认黑色。
-    :param verbose: 是否打印详细日志。
-    :raises typer.Exit: 处理异常时退出程序。
     """
     try:
         if verbose:
@@ -107,20 +97,6 @@ def clip(
 ) -> None:
     """
     生成固定时长的视频或GIF，自动抽取关键帧并控制文件大小。
-
-    :param video_path: 输入视频文件路径。
-    :param duration: 输出视频/GIF时长（秒），默认3秒。
-    :param fps: 输出帧率，默认10fps。
-    :param width: 输出视频宽度。
-    :param height: 输出视频高度。
-    :param ffmpeg: 是否使用FFmpeg模式提取关键帧。
-    :param threshold: 关键帧差异阈值，默认80。
-    :param gif: 是否输出GIF格式，默认输出视频。
-    :param loop: GIF是否循环播放，默认循环。
-    :param target_size_mb: 目标文件大小（MB），默认5MB。
-    :param output_path: 输出视频/GIF路径，默认自动生成。
-    :param verbose: 是否打印详细日志。
-    :raises typer.Exit: 处理异常时退出程序。
     """
     import math
 

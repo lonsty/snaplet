@@ -1,3 +1,5 @@
+import io
+import json
 import math
 import os
 import shutil
@@ -66,99 +68,92 @@ class SnapletManager:
 
         return self._extract_keyframes_frame_diff(video_path, threshold, verbose)
 
-    def _extract_keyframes_ffmpeg(self, video_path: str, max_frames: Optional[int], verbose: bool) -> List[Image.Image]:
+    def _get_keyframe_timestamps(self, video_path: str, verbose: bool = False) -> List[float]:
         """
-        使用FFmpeg提取视频编码中的I帧（关键帧）。
-
-        注意：
-            I帧分布由编码器决定，可能不均匀，通常集中在场景切换处。
-            本方法提取所有I帧后，调用方应自行均匀采样以避免帧集中。
-
-        :param video_path: 视频路径。
-        :param max_frames: 最大帧数限制。
-        :param verbose: 是否打印日志。
-        :return: 关键帧列表。
-        :raises RuntimeError: FFmpeg未安装或不可用。
+        使用 ffprobe 获取视频中所有关键帧的时间戳（秒）
         """
-        import io
-        import shutil
-
-        if not shutil.which(FFMPEG_CMD):
-            raise RuntimeError("FFmpeg 未安装或未加入系统PATH")
-
-        if verbose:
-            print(f"[FFmpeg] 提取关键帧，最大帧数: {max_frames or '无限制'}")
-
         cmd = [
-            FFMPEG_CMD,
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-i",
+            "ffprobe",
+            "-select_streams", "v",
+            "-skip_frame", "nokey",
+            "-show_frames",
+            "-show_entries", "frame=pkt_pts_time,pkt_dts_time,key_frame",
+            "-print_format", "json",
             video_path,
-            "-vf",
-            "select=eq(pict_type\\,I)",
-            "-vsync",
-            "0",
-            "-f",
-            "image2pipe",
-            "-vcodec",
-            "png",
-            "-",
         ]
+        if verbose:
+            print(f"[FFprobe] 获取关键帧时间戳: {' '.join(cmd)}")
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise RuntimeError(f"ffprobe 失败: {proc.stderr}")
 
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE if verbose else subprocess.DEVNULL,
-            bufsize=10**8,
-        )
+        frames = json.loads(proc.stdout).get("frames", [])
+        timestamps = []
+        for f in frames:
+            ts = f.get("pkt_pts_time")
+            if ts is None:
+                ts = f.get("pkt_dts_time")
+            if ts is not None:
+                timestamps.append(float(ts))
+        if verbose:
+            print(f"[FFprobe] 共找到 {len(timestamps)} 个关键帧")
+        return timestamps
+
+    def _extract_keyframes_ffmpeg(
+        self,
+        video_path: str,
+        max_frames: Optional[int],
+        verbose: bool = False,
+    ) -> List[Image.Image]:
+        """
+        优化版：均匀采样关键帧，避免一次性提取所有关键帧导致内存占用过高。
+        """
+        timestamps = self._get_keyframe_timestamps(video_path, verbose=verbose)
+        if not timestamps:
+            if verbose:
+                print("[FFmpeg] 未找到关键帧，尝试全帧提取")
+            # 这里可以fallback到原方法或抛异常
+            return []
+
+        # 如果 max_frames 未限制或大于关键帧数，取全部
+        if max_frames is None or max_frames >= len(timestamps):
+            selected_ts = timestamps
+        else:
+            # 均匀采样时间戳
+            step = len(timestamps) / max_frames
+            selected_ts = [timestamps[int(i * step)] for i in range(max_frames)]
 
         keyframes = []
-        frame_count = 0
-
-        buffer = b""
-
-        try:
-            while True:
-                if max_frames is not None and frame_count >= max_frames:
-                    break
-
-                data = process.stdout.read(4096)
-                if not data:
-                    break
-                buffer += data
-
-                while True:
-                    start_idx = buffer.find(PNG_HEADER)
-                    if start_idx == -1:
-                        break
-                    iend_idx = buffer.find(PNG_IEND, start_idx)
-                    if iend_idx == -1 or iend_idx + 8 > len(buffer):
-                        break
-                    end_idx = iend_idx + 8
-                    png_data = buffer[start_idx:end_idx]
-                    buffer = buffer[end_idx:]
-
-                    try:
-                        img = Image.open(io.BytesIO(png_data))
-                        img.load()
-                        if img.mode != "RGB":
-                            img = img.convert("RGB")
-                        keyframes.append(img)
-                        frame_count += 1
-                        if verbose:
-                            print(f"[FFmpeg] 解析关键帧 #{frame_count}")
-                    except Exception as e:
-                        if verbose:
-                            print(f"[FFmpeg] 解析关键帧失败: {e}")
-                        continue
-        finally:
-            if process.stdout:
-                process.stdout.close()
-            if process.stderr:
-                process.stderr.close()
-            process.wait()
+        for i, ts in enumerate(selected_ts, 1):
+            if verbose:
+                print(f"[FFmpeg] 提取关键帧 {i}/{len(selected_ts)}，时间点: {ts:.3f}s")
+            cmd = [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel", "error",
+                "-ss", str(ts),
+                "-i", video_path,
+                "-frames:v", "1",
+                "-f", "image2pipe",
+                "-vcodec", "png",
+                "-",
+            ]
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            out, err = proc.communicate()
+            if proc.returncode != 0:
+                if verbose:
+                    print(f"[FFmpeg] 提取关键帧失败，时间点 {ts}: {err.decode(errors='ignore')}")
+                continue
+            try:
+                img = Image.open(io.BytesIO(out))
+                img.load()
+                if img.mode != "RGB":
+                    img = img.convert("RGB")
+                keyframes.append(img)
+            except Exception as e:
+                if verbose:
+                    print(f"[FFmpeg] 解析关键帧失败: {e}")
+                continue
 
         if verbose:
             print(f"[FFmpeg] 实际提取关键帧数: {len(keyframes)}")
